@@ -171,3 +171,51 @@ We have some great contributions from the community, and while these aren't main
 [eShopOnWeb VB.NET](https://github.com/VBAndCs/eShopOnWeb_VB.NET) by Mohammad Hamdy Ghanem
 
 [FShopOnWeb](https://github.com/NitroDevs/FShopOnWeb) An F# take on eShopOnWeb by Sean G. Wright and Kyle McMaster
+
+flowchart TD
+    User[("用户 (Browser)")]
+
+    subgraph Edge [边缘安全与加速]
+        CDN[CDN & WAF<br/>CloudFront / Azure Front Door]
+    end
+
+    subgraph Gateway [流量网关]
+        LB[负载均衡 & 入口网关<br/>ALB / Application Gateway]
+    end
+
+    subgraph Services [核心服务层]
+        Web[Web 展示服务<br/>ASP.NET Core MVC]
+        API[API 服务<br/>ASP.NET Core Web API]
+        Admin[管理后台服务<br/>ASP.NET Core Admin]
+    end
+
+    subgraph Storage [存储服务]
+        S3[对象存储<br/>S3 / Blob]
+    end
+
+    subgraph Logic [业务逻辑层]
+        Core[业务逻辑服务<br/>Clean Architecture Core]
+    end
+
+    subgraph DataLayer [数据存储服务]
+        RDS[(关系数据库<br/>RDS Postgres)]
+        Cache[(缓存服务<br/>ElastiCache Redis)]
+        Blob[(对象存储<br/>S3 / Blob Storage)]
+    end
+
+    User --> Edge --> LB
+
+    LB -- "/" --> Web
+    LB -- "/api/*" --> API
+    LB -- "/admin/*" --> Admin
+    LB -- "静态资源" --> S3
+
+    Web --> Core
+    API --> Core
+    Admin --> Core
+
+    Core --> RDS
+    Core --> Cache
+    Core --> Blob
+
+    S3 -.-> Blob
