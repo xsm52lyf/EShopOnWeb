@@ -1,0 +1,124 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../environments/nonprod
+
+namespace: corecommerce-dev
+
+commonLabels:
+  app.kubernetes.io/environment: dev
+  corecommerce.io/cost-optimized: "true"
+
+configMapGenerator:
+  - name: app-settings
+    behavior: merge
+    literals:
+      - Catalog__PicBaseUrl=https://static.dev.corecommerce.local
+      - CACHE_DEFAULT_EXPIRATION_MINUTES=1
+      - EventBus__SubscriptionClientName=CoreCommerce-Dev
+
+images:
+  - name: corecommerce-web
+    newTag: dev-latest
+
+patches:
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: corecommerce-web
+      spec:
+        replicas: 1
+    target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: corecommerce-web
+
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: corecommerce-web
+      spec:
+        template:
+          spec:
+            containers:
+              - name: corecommerce-web
+                resources:
+                  requests:
+                    cpu: "100m"
+                    memory: "128Mi"
+                  limits:
+                    cpu: "500m"
+                    memory: "512Mi"
+    target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: corecommerce-web
+
+  - patch: |-
+      apiVersion: autoscaling/v2
+      kind: HorizontalPodAutoscaler
+      metadata:
+        name: corecommerce-web-hpa
+      spec:
+        minReplicas: 1
+        maxReplicas: 3
+    target:
+      group: autoscaling
+      version: v2
+      kind: HorizontalPodAutoscaler
+      name: corecommerce-web-hpa
+
+  - patch: |-
+      apiVersion: networking.k8s.io/v1
+      kind: Ingress
+      metadata:
+        name: corecommerce-web-ingress
+      spec:
+        tls:
+          - hosts:
+              - dev.corecommerce.local
+            secretName: corecommerce-tls-dev
+        rules:
+          - host: dev.corecommerce.local
+    target:
+      group: networking.k8s.io
+      version: v1
+      kind: Ingress
+      name: corecommerce-web-ingress
+
+  - patch: |-
+      apiVersion: external-secrets.io/v1beta1
+      kind: ExternalSecret
+      metadata:
+        name: corecommerce-db-secret
+      spec:
+        data:
+          - secretKey: connectionString
+            remoteRef:
+              key: corecommerce/dev/db-master-password
+    target:
+      group: external-secrets.io
+      version: v1beta1
+      kind: ExternalSecret
+      name: corecommerce-db-secret
+
+  - patch: |-
+      apiVersion: external-secrets.io/v1beta1
+      kind: ExternalSecret
+      metadata:
+        name: corecommerce-redis-secret
+      spec:
+        data:
+          - secretKey: connectionString
+            remoteRef:
+              key: corecommerce/dev/redis-auth
+    target:
+      group: external-secrets.io
+      version: v1beta1
+      kind: ExternalSecret
+      name: corecommerce-redis-secret

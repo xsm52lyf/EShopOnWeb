@@ -1,0 +1,86 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../environments/production
+
+namespace: corecommerce-prod
+
+commonLabels:
+  app.kubernetes.io/environment: production
+
+configMapGenerator:
+  - name: app-settings
+    behavior: merge
+    literals:
+      - Catalog__PicBaseUrl=https://static.corecommerce.com
+      - EventBus__SubscriptionClientName=CoreCommerce-Prod
+      - CACHE_DEFAULT_EXPIRATION_MINUTES=30
+      - Performance__EnableResponseCompression=true
+      - Security__EnableHsts=true
+
+  - name: environment-config
+    literals:
+      - waf_acl_arn=arn:aws:wafv2:us-east-1:123456789012:regional/webacl/corecommerce-prod-acl/xxx
+      - logging_bucket=corecommerce-alb-logs-prod
+      - logging_prefix=production
+
+images:
+  - name: corecommerce-web
+    newTag: stable
+
+patches:
+  # 仅覆盖生产环境真正独有的配置
+  - patch: |-
+      apiVersion: networking.k8s.io/v1
+      kind: Ingress
+      metadata:
+        name: corecommerce-web-ingress
+      spec:
+        tls:
+          - hosts:
+              - corecommerce.com
+              - www.corecommerce.com
+              - api.corecommerce.com
+            secretName: corecommerce-tls-prod
+        rules:
+          - host: corecommerce.com
+          - host: www.corecommerce.com
+          - host: api.corecommerce.com
+    target:
+      group: networking.k8s.io
+      version: v1
+      kind: Ingress
+      name: corecommerce-web-ingress
+  
+  - patch: |-
+      apiVersion: external-secrets.io/v1beta1
+      kind: ExternalSecret
+      metadata:
+        name: corecommerce-db-secret
+      spec:
+        data:
+          - secretKey: connectionString
+            remoteRef:
+              key: corecommerce/production/db-master-password
+    target:
+      group: external-secrets.io
+      version: v1beta1
+      kind: ExternalSecret
+      name: corecommerce-db-secret
+  
+  - patch: |-
+      apiVersion: external-secrets.io/v1beta1
+      kind: ExternalSecret
+      metadata:
+        name: corecommerce-redis-secret
+      spec:
+        data:
+          - secretKey: connectionString
+            remoteRef:
+              key: corecommerce/production/redis-auth
+    target:
+      group: external-secrets.io
+      version: v1beta1
+      kind: ExternalSecret
+      name: corecommerce-redis-secret

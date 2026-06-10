@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: corecommerce-web-svc
+  namespace: corecommerce
+  labels:
+    app: corecommerce-web
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-backend-protocol: http
+    service.beta.kubernetes.io/aws-load-balancer-ssl-ports: "443"
+spec:
+  type: NodePort
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+    - name: metrics
+      port: 8080
+      targetPort: metrics
+      protocol: TCP
+  selector:
+    app: corecommerce-web

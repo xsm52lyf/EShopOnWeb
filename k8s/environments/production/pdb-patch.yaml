@@ -1,0 +1,6 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: corecommerce-web-pdb
+spec:
+  minAvailable: 3

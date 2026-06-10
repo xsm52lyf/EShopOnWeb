@@ -1,0 +1,71 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: corecommerce-web-ingress
+  namespace: corecommerce
+  labels:
+    app: corecommerce-web
+  annotations:
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=60,routing.http.drop_invalid_header_fields.enabled=true,routing.http2.enabled=true
+    alb.ingress.kubernetes.io/healthcheck-protocol: HTTP
+    alb.ingress.kubernetes.io/healthcheck-port: traffic-port
+    alb.ingress.kubernetes.io/healthcheck-path: /health/ready
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: "15"
+    alb.ingress.kubernetes.io/healthcheck-timeout-seconds: "5"
+    alb.ingress.kubernetes.io/healthy-threshold-count: "2"
+    alb.ingress.kubernetes.io/unhealthy-threshold-count: "3"
+    alb.ingress.kubernetes.io/success-codes: "200-399"
+    
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+    alb.ingress.kubernetes.io/ssl-policy: "ELBSecurityPolicy-TLS13-1-2-2021-06"
+    
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    cert-manager.io/acme-challenge-type: http01
+    cert-manager.io/duration: "2160h"
+    cert-manager.io/renew-before: "720h"
+
+spec:
+  tls:
+    - hosts:
+        - corecommerce.local
+      secretName: corecommerce-tls
+  
+  rules:
+    - host: corecommerce.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: corecommerce-web-svc
+                port:
+                  number: 80
+          
+          - path: /api/
+            pathType: Prefix
+            backend:
+              service:
+                name: corecommerce-web-svc
+                port:
+                  number: 80
+          
+          - path: /health/
+            pathType: Prefix
+            backend:
+              service:
+                name: corecommerce-web-svc
+                port:
+                  number: 80
+          
+          - path: /swagger
+            pathType: Prefix
+            backend:
+              service:
+                name: corecommerce-web-svc
+                port:
+                  number: 80

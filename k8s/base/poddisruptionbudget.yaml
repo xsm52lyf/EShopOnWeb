@@ -1,0 +1,12 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: corecommerce-web-pdb
+  namespace: corecommerce
+  labels:
+    app: corecommerce-web
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: corecommerce-web

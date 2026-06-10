@@ -1,0 +1,24 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: corecommerce-web
+spec:
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 2
+      maxUnavailable: 0
+  template:
+    spec:
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+      containers:
+        - name: corecommerce-web
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: DOTNET_GCHeapHardLimit
+              value: "15000000"  # 1.5 GB
+          startupProbe:
+            failureThreshold: 20

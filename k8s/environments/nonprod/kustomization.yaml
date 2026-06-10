@@ -1,0 +1,50 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# 继承 base 所有配置
+resources:
+  - ../../base
+
+components:
+  - ../../components/alb-aws
+  - ../../components/cert-manager-staging
+
+patches:
+  - path: deployment-patch.yaml
+    target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: corecommerce-web
+  - path: hpa-patch.yaml
+    target:
+      group: autoscaling
+      version: v2
+      kind: HorizontalPodAutoscaler
+      name: corecommerce-web-hpa
+  - path: ingress-patch.yaml
+    target:
+      group: networking.k8s.io
+      version: v1
+      kind: Ingress
+      name: corecommerce-web-ingress
+
+configMapGenerator:
+  - name: app-settings
+    behavior: merge
+    literals:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - Logging__LogLevel__Default=Debug
+      - Logging__LogLevel__Microsoft=Information
+
+secretGenerator:
+  - name: db-connection-secret
+    behavior: replace
+    literals: []
+  - name: redis-connection-secret
+    behavior: replace
+    literals: []
+
+images:
+  - name: corecommerce-web
+    newTag: nonprod-latest

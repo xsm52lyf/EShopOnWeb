@@ -1,0 +1,129 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../environments/preprod
+
+namespace: corecommerce-staging
+
+commonLabels:
+  app.kubernetes.io/environment: staging
+
+configMapGenerator:
+  - name: app-settings
+    behavior: merge
+    literals:
+      - Catalog__PicBaseUrl=https://static.staging.corecommerce.local
+      - EventBus__SubscriptionClientName=CoreCommerce-Staging
+      - CACHE_DEFAULT_EXPIRATION_MINUTES=15
+
+  - name: environment-config
+    literals:
+      - waf_acl_arn=arn:aws:wafv2:us-east-1:123456789012:regional/webacl/corecommerce-staging-acl/xxx
+      - logging_bucket=corecommerce-alb-logs-staging
+      - logging_prefix=staging
+
+images:
+  - name: corecommerce-web
+    newTag: staging-stable
+
+patches:
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: corecommerce-web
+      spec:
+        replicas: 3
+    target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: corecommerce-web
+  
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: corecommerce-web
+      spec:
+        template:
+          spec:
+            containers:
+              - name: corecommerce-web
+                resources:
+                  requests:
+                    cpu: "500m"
+                    memory: "512Mi"
+                  limits:
+                    cpu: "2000m"
+                    memory: "2Gi"
+    target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: corecommerce-web
+  
+  - patch: |-
+      apiVersion: autoscaling/v2
+      kind: HorizontalPodAutoscaler
+      metadata:
+        name: corecommerce-web-hpa
+      spec:
+        minReplicas: 3
+        maxReplicas: 15
+    target:
+      group: autoscaling
+      version: v2
+      kind: HorizontalPodAutoscaler
+      name: corecommerce-web-hpa
+  
+  - patch: |-
+      apiVersion: networking.k8s.io/v1
+      kind: Ingress
+      metadata:
+        name: corecommerce-web-ingress
+      spec:
+        tls:
+          - hosts:
+              - staging.corecommerce.local
+            secretName: corecommerce-tls-staging
+        rules:
+          - host: staging.corecommerce.local
+    target:
+      group: networking.k8s.io
+      version: v1
+      kind: Ingress
+      name: corecommerce-web-ingress
+  
+  - patch: |-
+      apiVersion: external-secrets.io/v1beta1
+      kind: ExternalSecret
+      metadata:
+        name: corecommerce-db-secret
+      spec:
+        data:
+          - secretKey: connectionString
+            remoteRef:
+              key: corecommerce/staging/db-master-password
+    target:
+      group: external-secrets.io
+      version: v1beta1
+      kind: ExternalSecret
+      name: corecommerce-db-secret
+  
+  - patch: |-
+      apiVersion: external-secrets.io/v1beta1
+      kind: ExternalSecret
+      metadata:
+        name: corecommerce-redis-secret
+      spec:
+        data:
+          - secretKey: connectionString
+            remoteRef:
+              key: corecommerce/staging/redis-auth
+    target:
+      group: external-secrets.io
+      version: v1beta1
+      kind: ExternalSecret
+      name: corecommerce-redis-secret

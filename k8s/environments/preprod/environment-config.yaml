@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: environment-config
+  labels:
+    app: corecommerce-web
+data:
+  waf_acl_arn: arn:aws:wafv2:us-east-1:123456789012:regional/webacl/corecommerce-preprod-acl/placeholder
+  logging_bucket: corecommerce-alb-logs-preprod
+  logging_prefix: preprod

@@ -1,0 +1,15 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: corecommerce-web-monitor
+  labels:
+    release: prometheus-operator
+    monitoring: enabled
+spec:
+  selector:
+    matchLabels:
+      app: corecommerce-web
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s

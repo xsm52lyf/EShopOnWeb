@@ -1,0 +1,9 @@
+- op: add
+  path: /metadata/annotations/cert-manager.io~1cluster-issuer
+  value: letsencrypt-prod
+- op: add
+  path: /metadata/annotations/cert-manager.io~1duration
+  value: "2160h"
+- op: add
+  path: /metadata/annotations/cert-manager.io~1renew-before
+  value: "720h"

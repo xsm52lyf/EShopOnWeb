@@ -1,0 +1,67 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+
+components:
+  - ../../components/alb-aws
+  - ../../components/cert-manager-prod
+  - ../../components/waf-enabled
+  - ../../components/alb-logging
+  - ../../components/monitoring
+
+patches:
+  - path: deployment-patch.yaml
+    target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: corecommerce-web
+  - path: hpa-patch.yaml
+    target:
+      group: autoscaling
+      version: v2
+      kind: HorizontalPodAutoscaler
+      name: corecommerce-web-hpa
+  - path: ingress-patch.yaml
+    target:
+      group: networking.k8s.io
+      version: v1
+      kind: Ingress
+      name: corecommerce-web-ingress
+
+configMapGenerator:
+  - name: app-settings
+    behavior: merge
+    literals:
+      - ASPNETCORE_ENVIRONMENT=Staging
+      - Logging__LogLevel__Default=Information
+      - Logging__LogLevel__Microsoft=Warning
+
+images:
+  - name: corecommerce-web
+    newTag: preprod-stable
+
+vars:
+  - name: WAF_ACL_ARN
+    objref:
+      kind: ConfigMap
+      name: environment-config
+      apiVersion: v1
+    fieldref:
+      fieldpath: data.waf_acl_arn
+  - name: LOGGING_BUCKET
+    objref:
+      kind: ConfigMap
+      name: environment-config
+      apiVersion: v1
+    fieldref:
+      fieldpath: data.logging_bucket
+  - name: LOGGING_PREFIX
+    objref:
+      kind: ConfigMap
+      name: environment-config
+      apiVersion: v1
+    fieldref:
+      fieldpath: data.logging_prefix

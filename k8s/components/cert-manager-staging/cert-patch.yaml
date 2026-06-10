@@ -1,0 +1,6 @@
+- op: add
+  path: /metadata/annotations/cert-manager.io~1cluster-issuer
+  value: letsencrypt-staging
+- op: add
+  path: /metadata/annotations/cert-manager.io~1acme-challenge-type
+  value: http01

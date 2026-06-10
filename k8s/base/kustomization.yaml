@@ -1,0 +1,38 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - namespace.yaml
+  - serviceaccount.yaml
+  - deployment.yaml
+  - service.yaml
+  - configmap.yaml
+  - hpa.yaml
+  - networkpolicy.yaml
+  - poddisruptionbudget.yaml
+  - ingress.yaml
+  - externalsecret-db.yaml
+  - externalsecret-redis.yaml
+
+commonLabels:
+  app.kubernetes.io/name: corecommerce-web
+  app.kubernetes.io/part-of: corecommerce
+  app.kubernetes.io/managed-by: kustomize
+
+images:
+  - name: corecommerce-web
+    newName: 123456789012.dkr.ecr.us-east-1.amazonaws.com/corecommerce-web
+    newTag: latest
+
+configMapGenerator:
+  - name: app-settings
+    literals:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - ASPNETCORE_URLS=http://+:80
+      - Logging__LogLevel__Default=Information
+      - Logging__LogLevel__Microsoft=Warning
+      - Logging__LogLevel__Microsoft.Hosting.Lifetime=Information
+      - EventBus__SubscriptionClientName=CoreCommerce
+      - Catalog__PicBaseUrl=https://static.dev.corecommerce.local
+      - USE_REDIS_CACHE=true
+      - CACHE_DEFAULT_EXPIRATION_MINUTES=5

@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: environment-config
+  labels:
+    app: corecommerce-web
+data:
+  waf_acl_arn: arn:aws:wafv2:us-east-1:123456789012:regional/webacl/corecommerce-prod-acl/production
+  logging_bucket: corecommerce-alb-logs-prod
+  logging_prefix: production
