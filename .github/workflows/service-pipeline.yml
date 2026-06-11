@@ -1,0 +1,706 @@
+name: Service CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - 'release/*'
+    paths:
+      - 'src/**'
+      - '.github/workflows/service-pipeline.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'src/**'
+  workflow_dispatch:
+    inputs:
+      deploy_to:
+        description: '选择部署目标环境'
+        required: true
+        type: choice
+        options:
+          - dev
+          - test
+          - perf
+          - staging
+          - production
+          - all
+      deployment_strategy:
+        description: '生产环境部署策略'
+        required: false
+        type: choice
+        default: 'rolling'
+        options:
+          - rolling
+          - canary
+          - bluegreen
+env:
+  DOTNET_VERSION: '8.0.x'
+  IMAGE_NAME: corecommerce-web
+  AWS_REGION: us-east-1
+  ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+  ACR_REGISTRY: corecommerce.azurecr.io
+
+permissions:
+  id-token: write
+  contents: read
+  packages: write
+  security-events: write
+  pull-requests: write
+
+jobs:
+  ci:
+    name: Continuous Integration
+    runs-on: ubuntu-latest
+    outputs:
+      image-tag: ${{ steps.meta.outputs.version }}
+      image-digest: ${{ steps.build.outputs.digest }}
+      sonar-status: ${{ steps.sonar.outputs.status }}
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Setup Java (SonarCloud 依赖)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: network=host
+
+      - name: Cache NuGet Packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-
+
+      - name: Restore Dependencies
+        run: dotnet restore src/CoreCommerce.sln
+
+      - name: Build Solution
+        run: |
+          dotnet build src/CoreCommerce.sln \
+            --configuration Release \
+            --no-restore \
+            -p:TreatWarningsAsErrors=true
+
+      - name: Run Unit Tests
+        id: tests
+        run: |
+          dotnet test src/CoreCommerce.Tests/CoreCommerce.Tests.csproj \
+            --configuration Release \
+            --no-build \
+            --collect:"XPlat Code Coverage" \
+            --results-directory TestResults \
+            --logger "trx;LogFileName=test_results.trx" \
+            --logger "console;verbosity=detailed" \
+            -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Format=opencover
+
+      - name: Publish Test Results
+        if: always()
+        uses: dorny/test-reporter@v1
+        with:
+          name: dotnet-tests
+          path: '**/*.trx'
+          reporter: dotnet-trx
+          fail-on-error: true
+
+      - name: Upload Coverage Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: TestResults/**/coverage.opencover.xml
+
+      - name: Install SonarCloud Scanner
+        run: dotnet tool install --global dotnet-sonarscanner
+
+      - name: SonarCloud Analysis
+        id: sonar
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          dotnet sonarscanner begin \
+            /k:"${{ secrets.SONAR_PROJECT_KEY }}" \
+            /o:"${{ secrets.SONAR_ORGANIZATION }}" \
+            /d:sonar.host.url="https://sonarcloud.io" \
+            /d:sonar.token="${{ secrets.SONAR_TOKEN }}" \
+            /d:sonar.cs.opencover.reportsPaths="TestResults/**/coverage.opencover.xml" \
+            /d:sonar.coverage.exclusions="**/Migrations/**" \
+            /d:sonar.qualitygate.wait=true
+          
+          dotnet build src/CoreCommerce.sln --configuration Release --no-restore
+          
+          dotnet sonarscanner end /d:sonar.token="${{ secrets.SONAR_TOKEN }}"
+
+      - name: Check Quality Gate
+        if: github.ref == 'refs/heads/main'
+        run: |
+          STATUS=$(curl -s -u "${{ secrets.SONAR_TOKEN }}:" \
+            "https://sonarcloud.io/api/qualitygates/project_status?projectKey=${{ secrets.SONAR_PROJECT_KEY }}" \
+            | jq -r '.projectStatus.status')
+          
+          if [[ "$STATUS" != "OK" ]]; then
+            echo " SonarCloud Quality Gate failed!"
+            exit 1
+          fi
+          echo " SonarCloud Quality Gate passed"
+
+      - name: Generate Image Metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}
+            ${{ env.ACR_REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix={{branch}}-,format=short
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-ecr-role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Login to Azure Container Registry
+        uses: azure/docker-login@v1
+        with:
+          login-server: ${{ env.ACR_REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Build Multi-Arch Docker Image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: false 
+          load: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=oci,dest=/tmp/image.tar
+
+      - name: Run Trivy Vulnerability Scanner
+        id: trivy
+        uses: aquasecurity/trivy-action@0.20.0
+        with:
+          input: /tmp/image.tar
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+        continue-on-error: ${{ github.event_name == 'pull_request' }}
+
+      - name: Upload Trivy Results
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-results.sarif'
+          category: trivy-container
+
+      - name: Check Trivy Results
+        run: |
+          if [[ "${{ steps.trivy.outcome }}" == "failure" ]]; then
+            echo "Critical/High vulnerabilities found!"
+            if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+              echo "Blocking production deployment due to critical vulnerabilities!"
+              exit 1
+            fi
+          fi
+
+      - name: Build and Push Docker Image
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: true
+          sbom: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Sign Images with Cosign
+        if: github.ref == 'refs/heads/main'
+        uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: 'v2.2.3'
+
+      - name: Sign Image
+        if: github.ref == 'refs/heads/main'
+        run: |
+          cosign sign --yes --key awskms:///${{ secrets.COSIGN_KMS_KEY_ARN }} \
+            ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+
+  cd-nonprod:
+    name:  CD - ${{ matrix.environment }}
+    needs: ci
+    if: |
+      always() &&
+      needs.ci.result == 'success' &&
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/'))
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: [dev, test, perf, staging]
+        cloud:
+          - aws
+          - azure
+        exclude:
+          - environment: dev
+            cloud: azure
+          - environment: test
+            cloud: azure
+    
+    environment:
+      name: ${{ matrix.environment }}-${{ matrix.cloud }}
+      url: https://${{ matrix.environment }}.corecommerce.local
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Kustomize
+        uses: imranismail/setup-kustomize@v2
+        with:
+          kustomize-version: '5.3.0'
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.29.0'
+
+      - name: Configure AWS Credentials
+        if: matrix.cloud == 'aws'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-k8s-deploy-role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig (AWS)
+        if: matrix.cloud == 'aws'
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ env.AWS_REGION }} \
+            --name corecommerce-cluster-${{ matrix.environment }} \
+            --kubeconfig ${{ runner.temp }}/kubeconfig
+
+      - name: Update kubeconfig (Azure)
+        if: matrix.cloud == 'azure'
+        run: |
+          az aks get-credentials \
+            --resource-group rg-corecommerce-${{ matrix.environment }} \
+            --name corecommerce-aks-${{ matrix.environment }} \
+            --overwrite-existing \
+            --file ${{ runner.temp }}/kubeconfig
+
+      - name: Deploy to ${{ matrix.environment }}
+        env:
+          KUBECONFIG: ${{ runner.temp }}/kubeconfig
+        run: |
+          IMAGE_TAG=${{ needs.ci.outputs.image-tag }}
+          NAMESPACE="corecommerce-${{ matrix.environment }}"
+          
+          echo "Deploying to ${{ matrix.environment }} (${{ matrix.cloud }})..."
+          echo "Image Tag: ${IMAGE_TAG}"
+          echo "Namespace: ${NAMESPACE}"
+          
+          kubectl create namespace ${NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
+          
+          cd k8s/overlays/${{ matrix.environment }}
+          kustomize edit set image ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}=${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${IMAGE_TAG}
+          kustomize build . | kubectl apply -f -
+          
+          echo "Waiting for deployment to complete..."
+          kubectl rollout status deployment/corecommerce-web \
+            -n ${NAMESPACE} \
+            --timeout=10m
+
+      - name: Health Check
+        env:
+          KUBECONFIG: ${{ runner.temp }}/kubeconfig
+        run: |
+          NAMESPACE="corecommerce-${{ matrix.environment }}"
+          
+          echo "Checking Pod status..."
+          kubectl get pods -n ${NAMESPACE} -l app=corecommerce-web
+          
+          READY_PODS=$(kubectl get deployment corecommerce-web -n ${NAMESPACE} \
+            -o jsonpath='{.status.readyReplicas}')
+          DESIRED_PODS=$(kubectl get deployment corecommerce-web -n ${NAMESPACE} \
+            -o jsonpath='{.spec.replicas}')
+          
+          if [ "${READY_PODS}" != "${DESIRED_PODS}" ]; then
+            echo "Not all pods are ready! (${READY_PODS}/${DESIRED_PODS})"
+            exit 1
+          fi
+          
+          echo "All pods are ready! (${READY_PODS}/${DESIRED_PODS})"
+          
+          INGRESS_HOST=$(kubectl get ingress corecommerce-web-ingress \
+            -n ${NAMESPACE} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          
+          if [ -n "${INGRESS_HOST}" ]; then
+            echo "Testing endpoint: ${INGRESS_HOST}"
+            for i in {1..10}; do
+              HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" https://${INGRESS_HOST}/health/ready || echo "000")
+              if [ "${HTTP_CODE}" == "200" ]; then
+                echo " Endpoint health check passed!"
+                break
+              fi
+              echo "Waiting for endpoint... (${i}/10)"
+              sleep 10
+            done
+          fi
+
+  cd-production:
+    name:  CD - Production (${{ inputs.deployment_strategy || 'rolling' }})
+    needs: ci
+    if: |
+      always() &&
+      needs.ci.result == 'success' &&
+      (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://corecommerce.com
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Tools
+        run: |
+          curl -LO "https://dl.k8s.io/release/v1.29.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+          
+          curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
+          sudo mv kustomize /usr/local/bin/
+          
+          curl -LO https://github.com/argoproj/argo-rollouts/releases/latest/download/kubectl-argo-rollouts-linux-amd64
+          chmod +x kubectl-argo-rollouts-linux-amd64
+          sudo mv kubectl-argo-rollouts-linux-amd64 /usr/local/bin/kubectl-argo-rollouts
+          
+          curl -sSL -o argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+          chmod +x argocd
+          sudo mv argocd /usr/local/bin/
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-production-deploy-role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig (Production AWS)
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ env.AWS_REGION }} \
+            --name corecommerce-cluster-production \
+            --kubeconfig ${{ runner.temp }}/kubeconfig
+
+      - name: Determine Deployment Strategy
+        id: strategy
+        run: |
+          STRATEGY="${{ inputs.deployment_strategy || 'rolling' }}"
+          echo "strategy=${STRATEGY}" >> $GITHUB_OUTPUT
+          echo "Selected deployment strategy: ${STRATEGY}"
+
+      - name: Rolling Update Deployment
+        if: steps.strategy.outputs.strategy == 'rolling'
+        env:
+          KUBECONFIG: ${{ runner.temp }}/kubeconfig
+        run: |
+          IMAGE_TAG=${{ needs.ci.outputs.image-tag }}
+          NAMESPACE="corecommerce-prod"
+          
+          echo " Performing Rolling Update..."
+          
+          cd k8s/overlays/production
+          kustomize edit set image ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}=${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${IMAGE_TAG}
+          kustomize build . | kubectl apply -f -
+          
+          kubectl rollout status deployment/corecommerce-web \
+            -n ${NAMESPACE} \
+            --timeout=15m
+          
+          kubectl get pods -n ${NAMESPACE} -l app=corecommerce-web
+
+      - name: Canary Deployment with Argo Rollouts
+        if: steps.strategy.outputs.strategy == 'canary'
+        env:
+          KUBECONFIG: ${{ runner.temp }}/kubeconfig
+        run: |
+          IMAGE_TAG=${{ needs.ci.outputs.image-tag }}
+          NAMESPACE="corecommerce-prod"
+          
+          echo "Performing Canary Deployment..."
+          
+          if kubectl get rollout corecommerce-web -n ${NAMESPACE} &>/dev/null; then
+            echo "Rollout already exists, updating..."
+            kubectl-argo-rollouts set image corecommerce-web \
+              corecommerce-web=${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${IMAGE_TAG} \
+              -n ${NAMESPACE}
+          else
+            echo "Creating Rollout..."
+            cd k8s/overlays/production
+            kustomize edit set image ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}=${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${IMAGE_TAG}
+            kustomize build . | kubectl apply -f -
+          fi
+          
+          echo "Phase 1: Canary 10% traffic..."
+          kubectl-argo-rollouts promote corecommerce-web -n ${NAMESPACE} --full=false || true
+          
+          sleep 60
+          
+          for i in {1..30}; do
+            CANARY_STATUS=$(kubectl-argo-rollouts status corecommerce-web -n ${NAMESPACE} --watch=false 2>&1 || true)
+            echo "Canary Status: ${CANARY_STATUS}"
+            
+            if echo "${CANARY_STATUS}" | grep -q "Healthy\|Paused"; then
+              echo "Canary is healthy!"
+              break
+            elif echo "${CANARY_STATUS}" | grep -q "Degraded\|Failed"; then
+              echo "Canary is degraded! Rolling back..."
+              .github/scripts/canary-analysis.sh rollback ${NAMESPACE} corecommerce-web
+              exit 1
+            fi
+            
+            sleep 10
+          done
+          
+          echo "Phase 2: Canary 50% traffic..."
+          kubectl-argo-rollouts set canary-step --set-weight=50 \
+            corecommerce-web -n ${NAMESPACE}
+          
+          sleep 300 
+          
+          echo "Phase 3: Promoting to 100%..."
+          kubectl-argo-rollouts promote corecommerce-web -n ${NAMESPACE} --full
+          
+          kubectl-argo-rollouts status corecommerce-web -n ${NAMESPACE} --watch --timeout=10m
+
+      - name: Blue/Green Deployment with Argo Rollouts
+        if: steps.strategy.outputs.strategy == 'bluegreen'
+        env:
+          KUBECONFIG: ${{ runner.temp }}/kubeconfig
+        run: |
+          IMAGE_TAG=${{ needs.ci.outputs.image-tag }}
+          NAMESPACE="corecommerce-prod"
+          
+          echo " Blue/Green Deployment..."
+          
+          kubectl-argo-rollouts set image corecommerce-web \
+            corecommerce-web=${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${IMAGE_TAG} \
+            -n ${NAMESPACE}
+          
+          echo "Waiting for green (new) version to be ready..."
+          kubectl-argo-rollouts status corecommerce-web -n ${NAMESPACE} --watch --timeout=10m
+          
+          echo "Running smoke tests against green version..."
+          PREVIEW_SERVICE="corecommerce-web-preview.${NAMESPACE}.svc.cluster.local"
+          
+          if .github/scripts/canary-analysis.sh smoke-test ${PREVIEW_SERVICE}; then
+            echo " Smoke tests passed!"
+          else
+            echo " Smoke tests failed! Aborting promotion..."
+            kubectl-argo-rollouts abort corecommerce-web -n ${NAMESPACE}
+            exit 1
+          fi
+          
+          if [[ "${AUTO_PROMOTE:-true}" != "true" ]]; then
+            echo " Waiting for manual promotion approval..."
+            exit 0  # Rollout 保持暂停状态，等待手动 promote
+          fi
+          
+          echo "Promoting green to active..."
+          kubectl-argo-rollouts promote corecommerce-web -n ${NAMESPACE} --full
+          
+          sleep 30
+          
+          echo "Verifying new version..."
+          kubectl-argo-rollouts status corecommerce-web -n ${NAMESPACE} --watch --timeout=5m
+
+      - name: Production Health Check
+        if: always()
+        env:
+          KUBECONFIG: ${{ runner.temp }}/kubeconfig
+        run: |
+          NAMESPACE="corecommerce-prod"
+          
+          echo "Running Production Health Checks..."
+          
+          kubectl get pods -n ${NAMESPACE} -l app=corecommerce-web -o wide
+          
+          UNHEALTHY_PODS=$(kubectl get pods -n ${NAMESPACE} -l app=corecommerce-web \
+            -o jsonpath='{.items[?(@.status.phase!="Running")].metadata.name}')
+          
+          if [ -n "${UNHEALTHY_PODS}" ]; then
+            echo " Unhealthy pods found: ${UNHEALTHY_PODS}"
+            exit 1
+          fi
+          
+          RESTART_COUNT=$(kubectl get pods -n ${NAMESPACE} -l app=corecommerce-web \
+            -o jsonpath='{.items[*].status.containerStatuses[0].restartCount}' | tr ' ' '\n' | sort -nr | head -1)
+          
+          if [ "${RESTART_COUNT}" -gt 3 ]; then
+            echo "High restart count detected: ${RESTART_COUNT}"
+          fi
+          
+          kubectl get hpa -n ${NAMESPACE}
+          
+          ENDPOINT="https://corecommerce.com/health/ready"
+          for i in {1..10}; do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" ${ENDPOINT} || echo "000")
+            if [ "${HTTP_CODE}" == "200" ]; then
+              echo " Production endpoint healthy!"
+              break
+            fi
+            echo "Retrying health check... (${i}/10)"
+            sleep 15
+          done
+
+      - name: Auto Rollback on Failure
+        if: failure()
+        env:
+          KUBECONFIG: ${{ runner.temp }}/kubeconfig
+        run: |
+          NAMESPACE="corecommerce-prod"
+          
+          echo " Deployment failure detected! Initiating Auto Rollback..."
+          
+          DEPLOY_STRATEGY="${{ steps.strategy.outputs.strategy }}"
+          
+          case "${DEPLOY_STRATEGY}" in
+            rolling)
+              echo "Rolling back Deployment..."
+              kubectl rollout undo deployment/corecommerce-web -n ${NAMESPACE}
+              kubectl rollout status deployment/corecommerce-web -n ${NAMESPACE} --timeout=10m
+              ;;
+            canary|bluegreen)
+              echo "Rolling back Argo Rollout..."
+              kubectl-argo-rollouts abort corecommerce-web -n ${NAMESPACE}
+              kubectl-argo-rollouts status corecommerce-web -n ${NAMESPACE} --watch --timeout=10m
+              ;;
+          esac
+          
+          echo "Rollback completed successfully"
+
+      - name: Notify Deployment Status
+        if: always()
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          payload: |
+            {
+              "channel": "#deployments",
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": " Production Deployment - ${{ job.status }}"
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    { "type": "mrkdwn", "text": "*Strategy:*\n${{ steps.strategy.outputs.strategy }}" },
+                    { "type": "mrkdwn", "text": "*Image:*\n${{ needs.ci.outputs.image-tag }}" }
+                  ]
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    { "type": "mrkdwn", "text": "*Actor:*\n${{ github.actor }}" },
+                    { "type": "mrkdwn", "text": "*Commit:*\n<${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}|${{ github.sha }}>" }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  cd-dr-site:
+    name:  CD - Azure DR Site
+    needs: ci
+    if: |
+      always() &&
+      needs.ci.result == 'success' &&
+      github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: production-azure-dr
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Tools
+        run: |
+          curl -LO "https://dl.k8s.io/release/v1.29.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+          
+          curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
+          sudo mv kustomize /usr/local/bin/
+
+      - name: Configure Azure Credentials
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy to Azure AKS (DR Site)
+        env:
+          KUBECONFIG: ${{ runner.temp }}/kubeconfig-azure
+        run: |
+          IMAGE_TAG=${{ needs.ci.outputs.image-tag }}
+          
+          az aks get-credentials \
+            --resource-group rg-corecommerce-prod \
+            --name corecommerce-aks-production \
+            --overwrite-existing \
+            --file ${KUBECONFIG}
+          
+          cd k8s/overlays/production-azure
+          kustomize edit set image ${{ env.ACR_REGISTRY }}/${{ env.IMAGE_NAME }}=${{ env.ACR_REGISTRY }}/${{ env.IMAGE_NAME }}:${IMAGE_TAG}
+          kustomize build . | kubectl apply -f -
+          
+          kubectl rollout status deployment/corecommerce-web \
+            -n corecommerce-prod-azure \
+            --timeout=10m
+          
+          echo " DR site deployment completed!"

@@ -1,0 +1,386 @@
+name: Infrastructure as Code Pipeline
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'Infrastructure/**'
+      - '.github/workflows/infra-pipeline.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'Infrastructure/**'
+      - '.github/workflows/infra-pipeline.yml'
+
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: '选择要部署的环境'
+        required: true
+        type: choice
+        options:
+          - dev
+          - test
+          - perf
+          - staging
+          - production
+          - all
+      apply_changes:
+        description: '是否自动应用变更'
+        required: true
+        type: boolean
+        default: false
+
+env:
+  TF_VERSION: '1.7.4'
+  TERRAGRUNT_VERSION: '0.55.1'
+  AWS_REGION: us-east-1
+  AZURE_REGION: eastasia
+  TF_STATE_BUCKET_PREFIX: corecommerce-terraform-state
+  TF_STATE_LOCK_TABLE: terraform-state-lock
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+  actions: read
+  security-events: write
+
+jobs:
+  detect-changes:
+    name: Detect Changes
+    runs-on: ubuntu-latest
+    outputs:
+      environments: ${{ steps.set-environments.outputs.environments }}
+      has-changes: ${{ steps.set-environments.outputs.has-changes }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set Environments Matrix
+        id: set-environments
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            if [[ "${{ inputs.environment }}" == "all" ]]; then
+              ENVS='["dev","test","perf","staging","production"]'
+            else
+              ENVS='["${{ inputs.environment }}"]'
+            fi
+          else
+            CHANGED_FILES=$(git diff --name-only ${{ github.event.before }} ${{ github.sha }})
+            echo "Changed files: $CHANGED_FILES"
+            
+            ENVS='[]'
+            if echo "$CHANGED_FILES" | grep -q 'live/dev/'; then
+              ENVS=$(echo $ENVS | jq '. + ["dev"]')
+            fi
+            if echo "$CHANGED_FILES" | grep -q 'live/test/'; then
+              ENVS=$(echo $ENVS | jq '. + ["test"]')
+            fi
+            if echo "$CHANGED_FILES" | grep -q 'live/perf/'; then
+              ENVS=$(echo $ENVS | jq '. + ["perf"]')
+            fi
+            if echo "$CHANGED_FILES" | grep -q 'live/staging/'; then
+              ENVS=$(echo $ENVS | jq '. + ["staging"]')
+            fi
+            if echo "$CHANGED_FILES" | grep -q 'live/production/'; then
+              ENVS=$(echo $ENVS | jq '. + ["production"]')
+            fi
+            
+            if echo "$CHANGED_FILES" | grep -q 'modules/'; then
+              ENVS='["dev","test","perf","staging","production"]'
+            fi
+          fi
+          
+          echo "environments=${ENVS}" >> $GITHUB_OUTPUT
+          
+          if [[ "$ENVS" == "[]" ]]; then
+            echo "has-changes=false" >> $GITHUB_OUTPUT
+          else
+            echo "has-changes=true" >> $GITHUB_OUTPUT
+          fi
+
+  validate-and-plan:
+    name: Validate & Plan - ${{ matrix.environment }}
+    needs: detect-changes
+    if: needs.detect-changes.outputs.has-changes == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: ${{ fromJSON(needs.detect-changes.outputs.environments) }}
+        cloud:
+          - aws
+          - azure
+        exclude:
+          - environment: dev
+            cloud: azure
+          - environment: test
+            cloud: azure
+    
+    defaults:
+      run:
+        working-directory: live/${{ matrix.environment }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Tools
+        uses: ./.github/actions/setup-tools
+        with:
+          terraform-version: ${{ env.TF_VERSION }}
+          terragrunt-version: ${{ env.TERRAGRUNT_VERSION }}
+          cloud-provider: ${{ matrix.cloud }}
+
+      - name: Configure AWS Credentials
+        if: matrix.cloud == 'aws'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-terraform-role
+          role-session-name: github-actions-${{ matrix.environment }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Configure Azure Credentials
+        if: matrix.cloud == 'azure'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Terraform Format Check
+        id: fmt
+        run: |
+          echo "Checking Terraform format"
+          if ! terraform fmt -check -recursive ../../; then
+            echo "Terraform format check failed!"
+            echo "Please run: terraform fmt -recursive"
+            exit 1
+          fi
+          echo "Terraform format check passed"
+
+      - name: Terraform Init
+        id: init
+        run: |
+          echo "Initializing Terraform for ${{ matrix.environment }} (${{ matrix.cloud }})..."
+          terraform init \
+            -backend-config="bucket=${{ env.TF_STATE_BUCKET_PREFIX }}-${{ matrix.environment }}" \
+            -backend-config="key=corecommerce/${{ matrix.environment }}/${{ matrix.cloud }}/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="encrypt=true" \
+            -backend-config="dynamodb_table=${{ env.TF_STATE_LOCK_TABLE }}-${{ matrix.environment }}"
+
+      - name: Terraform Validate
+        id: validate
+        run: |
+          echo "Validating Terraform configuration..."
+          terraform validate -no-color
+
+      - name: Security Scan with Checkov
+        id: checkov
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: live/${{ matrix.environment }}
+          framework: terraform
+          output_format: sarif
+          soft_fail: ${{ matrix.environment != 'production' }}
+          download_external_modules: true
+
+      - name: Upload Checkov Results
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: results.sarif
+          category: checkov-${{ matrix.environment }}
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          echo "Generating Terraform plan for ${{ matrix.environment }}..."
+          terraform plan \
+            -var-file="terraform.tfvars" \
+            -var="environment=${{ matrix.environment }}" \
+            -out=plan.tfplan \
+            -no-color \
+            -detailed-exitcode \
+            2>&1 | tee plan-output.txt
+            
+          PLAN_EXIT_CODE=${PIPESTATUS[0]}
+          echo "plan_exit_code=${PLAN_EXIT_CODE}" >> $GITHUB_OUTPUT
+          
+          if [ ${PLAN_EXIT_CODE} -eq 1 ]; then
+            echo "Terraform plan failed!"
+            exit 1
+          fi
+
+      - name: Post Plan to PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const planOutput = fs.readFileSync('live/${{ matrix.environment }}/plan-output.txt', 'utf8');
+            
+            const truncatedOutput = planOutput.length > 60000 
+              ? planOutput.substring(0, 60000) + '\n\n... (truncated)'
+              : planOutput;
+            
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## Terraform Plan - \`${{ matrix.environment }}\` (${{ matrix.cloud }})\n\n` +
+                    `### Status: ${steps.plan.outputs.plan_exit_code === '0' ? 'No Changes' : 'Changes Detected'}\n\n` +
+                    `<details><summary>Plan Output</summary>\n\n\`\`\`terraform\n${truncatedOutput}\n\`\`\`\n</details>`
+            });
+
+      - name: Upload Plan Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: plan-${{ matrix.environment }}-${{ matrix.cloud }}
+          path: |
+            live/${{ matrix.environment }}/plan.tfplan
+            live/${{ matrix.environment }}/plan-output.txt
+          retention-days: 7
+
+  approval-gate:
+    name: Manual Approval - Production
+    needs: validate-and-plan
+    if: |
+      (github.ref == 'refs/heads/main' || inputs.apply_changes == true) &&
+      contains(fromJSON(needs.detect-changes.outputs.environments), 'production')
+    runs-on: ubuntu-latest
+    environment:
+      name: production-approval
+      url: https://console.aws.amazon.com/console/home
+    steps:
+      - name: Approval Gate Information
+        run: |
+          echo "=============================================="
+          echo "  PRODUCTION DEPLOYMENT APPROVAL REQUIRED"
+          echo "=============================================="
+          echo ""
+          echo "Environment: production"
+          echo "Requested by: ${{ github.actor }}"
+          echo "Commit: ${{ github.sha }}"
+          echo "Branch: ${{ github.ref_name }}"
+          echo ""
+          echo "Changes to be applied:"
+          echo "  - AWS (us-east-1): Primary data center"
+          echo "  - Azure (eastasia): Disaster recovery site"
+          echo ""
+          echo "Please review the plan output in the Artifacts before approving."
+          echo "=============================================="
+
+  apply:
+    name: Apply - ${{ matrix.environment }}
+    needs: [validate-and-plan, approval-gate]
+    if: |
+      always() &&
+      (needs.validate-and-plan.result == 'success') &&
+      (needs.approval-gate.result == 'success' || needs.approval-gate.result == 'skipped')
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: ${{ fromJSON(needs.detect-changes.outputs.environments) }}
+        cloud:
+          - aws
+          - azure
+        exclude:
+          - environment: dev
+            cloud: azure
+          - environment: test
+            cloud: azure
+    environment:
+      name: ${{ matrix.environment }}
+    
+    defaults:
+      run:
+        working-directory: live/${{ matrix.environment }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Tools
+        uses: ./.github/actions/setup-tools
+        with:
+          terraform-version: ${{ env.TF_VERSION }}
+          cloud-provider: ${{ matrix.cloud }}
+
+      - name: Configure AWS Credentials
+        if: matrix.cloud == 'aws'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-terraform-role
+          role-session-name: github-actions-apply-${{ matrix.environment }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Configure Azure Credentials
+        if: matrix.cloud == 'azure'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ env.TF_STATE_BUCKET_PREFIX }}-${{ matrix.environment }}" \
+            -backend-config="key=corecommerce/${{ matrix.environment }}/${{ matrix.cloud }}/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      - name: Download Plan
+        uses: actions/download-artifact@v4
+        with:
+          name: plan-${{ matrix.environment }}-${{ matrix.cloud }}
+
+      - name: Apply Confirmation
+        id: confirm
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            if [[ "${{ inputs.apply_changes }}" != "true" ]]; then
+              echo "Apply skipped (manual confirmation required)"
+              echo "apply=false" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+          fi
+          echo "apply=true" >> $GITHUB_OUTPUT
+
+      - name: Terraform Apply
+        if: steps.confirm.outputs.apply == 'true'
+        id: apply
+        run: |
+          echo "Applying Terraform changes to ${{ matrix.environment }} (${{ matrix.cloud }})..."
+          terraform apply -auto-approve plan.tfplan 2>&1 | tee apply-output.txt
+          echo "Terraform apply completed!"
+
+      - name: Trigger DR Site Deployment
+        if: matrix.environment == 'production' && matrix.cloud == 'aws' && steps.confirm.outputs.apply == 'true'
+        run: |
+          echo "Triggering Azure DR site deployment..."
+          # 触发 Azure 灾备中心部署
+          gh workflow run infra-pipeline.yml \
+            -f environment=production-azure \
+            -f apply_changes=true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Notify Deployment Result
+        if: always()
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          payload: |
+            {
+              "channel": "#infra-deployments",
+              "text": "Terraform Apply - `${{ matrix.environment }}` (${{ matrix.cloud }})\nStatus: ${{ job.status }}\nActor: ${{ github.actor }}\nCommit: ${{ github.sha }}"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
