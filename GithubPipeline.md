@@ -1,7 +1,7 @@
 ```mermaid
-graph TD
+graph LR
     %% ==========================================
-    %% 样式与角色定义
+    %% 1. 样式与视觉定义
     %% ==========================================
     classDef devStyle fill:#f4ebff,stroke:#7f56d9,stroke-width:2px;
     classDef gitStyle fill:#e0f2fe,stroke:#0284c7,stroke-width:2px;
@@ -10,78 +10,51 @@ graph TD
     classDef k8sStyle fill:#eff6ff,stroke:#2563eb,stroke-width:2px;
 
     %% ==========================================
-    %% 研发与代码源
+    %% 2. 核心流程节点
     %% ==========================================
     Dev["🧑‍💻 开发者 (Developer)"]:::devStyle
+    GitHub["🐙 GitHub Repo<br>(Source of Truth)"]:::gitStyle
     
-    subgraph Repo_Layer [GitHub 源码托管]
-        GitHub["🐙 GitHub (Source of Truth)"]:::gitStyle
+    %% CI 阶段
+    subgraph CI_Pipeline ["🚀 GitHub Actions CI 流水线"]
+        CI_Run["运行 CI 任务"]:::ciStyle
+        CI_Tasks["▪️ dotnet build & test<br>▪️ SonarCloud 代码扫描<br>▪️ Docker Build & Tag<br>▪️ Trivy 镜像安全扫描<br>▪️ Push to ECR"]
+        CI_Run --- CI_Tasks
     end
 
-    Dev -->|"1. git push feature-1"| GitHub
+    %% 路由分水岭
+    Filter{"⚡ 路径过滤<br>(Path Filter)"}:::ciStyle
 
-    %% ==========================================
-    %% 持续集成 (CI)
-    %% ==========================================
-    subgraph CI_Layer [持续集成流水线]
-        GA_CI["🚀 GitHub Actions CI"]:::ciStyle
+    %% 基础设施轨道
+    subgraph Infra_Track ["🛠️ IaC 基础设施轨道 (GitHub Actions)"]
+        TF_Init["1. Validate & Plan"]:::ciStyle
+        TF_Appr{"2. Manual Approval<br>(仅 Prod)"}:::ciStyle
+        TF_Apply["3. Terraform Apply"]:::ciStyle
         
-        subgraph CI_Steps [并行验证任务]
-            direction LR
-            T1["Build & Test"]
-            T2["SonarCloud 扫描"]
-            T3["Docker 编译"]
-            T4["Trivy 镜像安全扫描"]
-            T5["Push to ECR"]
-        end
+        TF_Init --> TF_Appr
+        TF_Appr -->|Approved| TF_Apply
     end
 
-    GitHub -->|"2. PR 合并到 main 分支"| GA_CI
-    GA_CI -->|"3. 触发并行执行"| CI_Steps
-
-    %% ==========================================
-    %% 双轨触发器（路径与分支过滤）
-    %% ==========================================
-    Filter{"⚡ 分支 / 路径过滤过滤 (Path Filter)"}:::ciStyle
-    CI_Steps --> Filter
-
-    %% ==========================================
-    %% 轨道 A：基础设施流水线 (IaC)
-    %% ==========================================
-    subgraph Infra_Track [基础设施仓库 - Infra Pipeline]
-        direction TB
-        GA_Infra["🛠️ Infra CD (GitHub Actions)"]:::ciStyle
+    %% GitOps 应用轨道
+    subgraph Service_Track ["🐙 GitOps 应用部署轨道 (ArgoCD)"]
+        Argo_Watch["1. 自动监控 Manifest"]:::cdStyle
+        Argo_Sync["2. Kustomize 镜像版本更新<br>(dev/test/perf/prod)"]:::cdStyle
         
-        subgraph TF_Stages [Terraform 阶段]
-            S1["Validate & Lint"] --> S2["Terraform Plan"]
-            S2 --> S3{"Manual Approval<br>(仅针对 Prod 环境)"}
-            S3 -->|"Approved"| S4["Terraform Apply"]
-        end
-        
-        Env["🌍 环境列表<br>(dev, test, perf, staging, prod)"]
-    end
-    
-    Filter -->|"路径包含 infra/main"| GA_Infra
-    GA_Infra --> TF_Stages
-
-    %% ==========================================
-    %% 轨道 B：应用部署流水线 (GitOps)
-    %% ==========================================
-    subgraph Service_Track [应用部署仓库 - Service Pipeline]
-        direction TB
-        ArgoCD["🐙 Service CD (ArgoCD)"]:::cdStyle
-        Argo_Manifest["📋 Kustomize Overlays<br>(dev/test/perf/prod 配置)"]
+        Argo_Watch --> Argo_Sync
     end
 
-    Filter -->|"路径包含 src/"| ArgoCD
-    ArgoCD -->|"监控并读取最新配置"| Argo_Manifest
+    %% 最终目标
+    K8s["☸️ Kubernetes 集群<br>(EKS / AKS)"]:::k8sStyle
 
     %% ==========================================
-    %% 最终交付目标 (Kubernetes)
+    %% 3. 连接上下游线（纯单向流，杜绝算法死循环）
     %% ==========================================
-    subgraph Cluster_Layer [目标运行时环境]
-        K8s["☸️ Kubernetes 集群 (EKS / AKS)"]:::k8sStyle
-    end
+    Dev -->|"1. git push"| GitHub
+    GitHub -->|"2. PR 合并到 main"| CI_Run
+    CI_Tasks --> Filter
 
-    TF_Stages -->|"5. 基础设施供应/更新"| K8s
-    Argo_Manifest -.->|"自动同步到集群<br>(支持蓝绿 / 金丝雀部署)"| K8s
+    Filter -->|"路径包含 infra/"| TF_Init
+    Filter -->|"路径包含 src/"| Argo_Watch
+
+    TF_Apply -->|"4. 更新集群基础资源"| K8s
+    Argo_Sync -.->|"4. 自动同步应用 Pods"| K8s
